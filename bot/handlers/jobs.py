@@ -13,7 +13,7 @@ from bot.keyboards import running_job_keyboard, main_menu
 from db.models import get_session_factory
 from db.queries import (
     get_session as db_get_session, create_job, update_job,
-    get_job, get_duplicates_for_job
+    get_job, get_duplicates_for_job, get_job_history, get_job_stats,
 )
 from userbot.engine import get_client
 from userbot.worker import run_transfer
@@ -217,43 +217,43 @@ async def cb_stop_job(cb: CallbackQuery):
 
 @router.callback_query(F.data == "my_jobs")
 async def cb_my_jobs(cb: CallbackQuery):
-    """Show last 5 jobs."""
-    from sqlalchemy import select
-    from db.models import TransferJob
-
+    """Show last 10 jobs with aggregate stats."""
     async with get_session_factory()() as db:
-        from sqlalchemy import select, desc
-        result = await db.execute(
-            select(TransferJob)
-            .where(TransferJob.user_id == cb.from_user.id)
-            .order_by(desc(TransferJob.id))
-            .limit(5)
-        )
-        jobs = result.scalars().all()
+        jobs = await get_job_history(db, cb.from_user.id, limit=10)
+        stats = await get_job_stats(db, cb.from_user.id)
 
     if not jobs:
         await cb.message.edit_text(
-            "📂 No transfer jobs yet.",
-            reply_markup=main_menu(logged_in=True)
+            "📂 No transfer jobs yet.\n\nStart a new transfer with ➕ New Transfer.",
+            reply_markup=main_menu(logged_in=True),
         )
         await cb.answer()
         return
 
-    lines = ["📂 <b>Recent Jobs</b>\n"]
     status_icons = {
         "done": "✅", "running": "⏳", "error": "❌",
-        "stopped": "⛔", "pending": "⏸"
+        "stopped": "⛔", "pending": "⏸",
     }
+
+    lines = [
+        "📂 <b>Recent Jobs</b>\n",
+        f"📊 All-time: {stats['total_jobs']} jobs · "
+        f"{stats['total_moved']} moved · "
+        f"{stats['total_skipped']} skipped\n",
+    ]
+
     for j in jobs:
         icon = status_icons.get(j.status, "❓")
         src = j.source_chat_title or "?"
         if j.source_topic_title:
-            src += f"→{j.source_topic_title}"
+            src += f" → {j.source_topic_title}"
         dst = j.dest_chat_title or "?"
+        if j.dest_topic_title:
+            dst += f" → {j.dest_topic_title}"
+        dry = " 🧪" if j.dry_run else ""
         lines.append(
-            f"{icon} <b>#{j.id}</b> {src} → {dst}\n"
-            f"   Moved: {j.moved}  Skipped: {j.skipped_duplicates}  "
-            f"{'(dry run)' if j.dry_run else ''}\n"
+            f"{icon} <b>#{j.id}</b>{dry} {src} → {dst}\n"
+            f"   ✅ {j.moved}  ⏭ {j.skipped_duplicates}  ❌ {j.errors}\n"
         )
 
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton

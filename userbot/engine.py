@@ -12,7 +12,12 @@ from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument,
     ForumTopic, Message
 )
-from telethon.errors import FloodWaitError, ChatForwardsRestrictedError
+from telethon.errors import (
+    FloodWaitError, ChatForwardsRestrictedError,
+    UserBannedInChannelError, ChatWriteForbiddenError,
+    ChannelPrivateError, ChatAdminRequiredError,
+    SlowModeWaitError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,28 +71,67 @@ async def get_dialogs(client: TelegramClient) -> dict:
         "private": [...],
     }
     Each entry: {"id": int, "title": str, "username": str|None, "has_topics": bool}
+    Handles deleted/restricted/inaccessible chats gracefully.
     """
     categories = {"groups": [], "channels": [], "private": []}
+    skipped = 0
 
-    async for dialog in client.iter_dialogs():
-        entity = dialog.entity
-        entry = {
-            "id": dialog.id,
-            "title": dialog.title or dialog.name or "Unknown",
-            "username": getattr(entity, "username", None),
-            "has_topics": getattr(entity, "forum", False),
-            "access_hash": getattr(entity, "access_hash", None),
-        }
-        if isinstance(entity, Channel):
-            if entity.megagroup or entity.gigagroup:
-                categories["groups"].append(entry)
-            else:
-                categories["channels"].append(entry)
-        elif isinstance(entity, Chat):
-            categories["groups"].append(entry)
-        elif isinstance(entity, User):
-            categories["private"].append(entry)
+    try:
+        async for dialog in client.iter_dialogs():
+            try:
+                entity = dialog.entity
+                if entity is None:
+                    skipped += 1
+                    continue
 
+                # Skip deactivated/deleted chats
+                if getattr(entity, "deactivated", False):
+                    skipped += 1
+                    continue
+
+                title = dialog.title or getattr(entity, "first_name", None) or "Unknown"
+                entry = {
+                    "id": dialog.id,
+                    "title": title,
+                    "username": getattr(entity, "username", None),
+                    "has_topics": getattr(entity, "forum", False),
+                    "access_hash": getattr(entity, "access_hash", None),
+                }
+
+                if isinstance(entity, Channel):
+                    if entity.megagroup or entity.gigagroup:
+                        categories["groups"].append(entry)
+                    else:
+                        categories["channels"].append(entry)
+                elif isinstance(entity, Chat):
+                    categories["groups"].append(entry)
+                elif isinstance(entity, User):
+                    if not entity.bot:  # skip bots in private list
+                        categories["private"].append(entry)
+
+            except Exception as inner_e:
+                skipped += 1
+                logger.debug(f"Skipping dialog due to error: {inner_e}")
+                continue
+
+    except FloodWaitError as e:
+        logger.warning(f"FloodWait during iter_dialogs: sleeping {e.seconds}s")
+        await asyncio.sleep(e.seconds + 2)
+        # Return whatever we collected so far
+    except Exception as e:
+        logger.error(f"Error during iter_dialogs: {e}")
+        raise
+
+    if skipped:
+        logger.info(f"Skipped {skipped} inaccessible/deleted dialogs")
+
+    total = sum(len(v) for v in categories.values())
+    logger.info(
+        f"Loaded {total} dialogs: "
+        f"{len(categories['groups'])} groups, "
+        f"{len(categories['channels'])} channels, "
+        f"{len(categories['private'])} private"
+    )
     return categories
 
 
@@ -214,40 +258,136 @@ def is_duplicate_fingerprint(info: dict, fingerprints: set[str]) -> tuple[bool, 
     return False, ""
 
 
+async def get_messages_in_range(
+    client: TelegramClient,
+    chat_id: int,
+    first_msg_id: int,
+    last_msg_id: int,
+    topic_id: Optional[int] = None,
+) -> list[Message]:
+    """
+    Fetch all messages between first_msg_id and last_msg_id (inclusive),
+    in chronological order. Handles topic filtering and edge cases.
+    """
+    messages: list[Message] = []
+    iter_kwargs: dict = {
+        "entity": chat_id,
+        "min_id": first_msg_id - 1,
+        "max_id": last_msg_id + 1,
+        "reverse": True,
+        "limit": None,
+    }
+    if topic_id:
+        iter_kwargs["reply_to"] = topic_id
+
+    try:
+        async for msg in client.iter_messages(**iter_kwargs):
+            messages.append(msg)
+    except ChannelPrivateError:
+        logger.error(f"Cannot access chat {chat_id}: channel is private")
+        raise
+    except FloodWaitError as e:
+        logger.warning(f"FloodWait fetching messages: sleeping {e.seconds}s")
+        await asyncio.sleep(e.seconds + 2)
+        # Retry once after flood wait
+        async for msg in client.iter_messages(**iter_kwargs):
+            messages.append(msg)
+    except Exception as e:
+        logger.error(f"Error fetching messages from {chat_id}: {e}")
+        raise
+
+    logger.info(
+        f"Fetched {len(messages)} messages from chat {chat_id} "
+        f"(range {first_msg_id}–{last_msg_id}, topic={topic_id})"
+    )
+    return messages
+
+
+def get_file_info(message: Message) -> Optional[dict]:
+    """
+    Public alias for _extract_file_info.
+    Returns dict with file_unique_id, file_size, file_type or None for text messages.
+    """
+    return _extract_file_info(message)
+
+
+def check_duplicate(info: dict, fingerprints: set[str]) -> tuple[bool, str]:
+    """
+    Check a file info dict against a fingerprint set.
+    Checks file_unique_id first (exact match), then file_size (fallback).
+    Returns (is_duplicate, reason_string).
+    """
+    if not info:
+        return False, ""
+    if info.get("file_unique_id"):
+        key = f"uid:{info['file_unique_id']}"
+        if key in fingerprints:
+            return True, "file_unique_id"
+    if info.get("file_size"):
+        key = f"sz:{info['file_size']}"
+        if key in fingerprints:
+            return True, "file_size"
+    return False, ""
+
+
 async def forward_message(client: TelegramClient,
                           source_chat_id: int,
                           message_id: int,
                           dest_chat_id: int,
-                          dest_topic_id: Optional[int] = None) -> bool:
+                          dest_topic_id: Optional[int] = None) -> tuple[bool, str]:
     """
-    Forward a single message preserving original sender header.
-    Returns True on success, False on failure.
+    Forward a single message preserving original sender header (drop_author=False).
+    Returns (success: bool, error_reason: str).
+    On permanent errors (restricted, banned, forbidden) returns immediately.
+    On transient errors (flood, network) retries up to 3 times.
     """
+    # Permanent errors — no point retrying
+    PERMANENT_ERRORS = (
+        ChatForwardsRestrictedError,
+        UserBannedInChannelError,
+        ChatWriteForbiddenError,
+        ChannelPrivateError,
+        ChatAdminRequiredError,
+    )
+
     for attempt in range(3):
         try:
-            kwargs = {
+            kwargs: dict = {
                 "from_peer": source_chat_id,
                 "message_ids": [message_id],
                 "to_peer": dest_chat_id,
-                "drop_author": False,   # Keep "Forwarded from X" header
+                "drop_author": False,   # Preserve "Forwarded from X" header
                 "with_my_score": False,
             }
             if dest_topic_id:
                 kwargs["top_msg_id"] = dest_topic_id
 
             await client.forward_messages(**kwargs)
-            return True
+            return True, ""
 
         except FloodWaitError as e:
-            logger.warning(f"FloodWait: sleeping {e.seconds}s")
-            await asyncio.sleep(e.seconds + 2)
+            wait = e.seconds + 2
+            logger.warning(f"FloodWait on msg {message_id}: sleeping {wait}s")
+            await asyncio.sleep(wait)
+            # Don't count flood wait as an attempt failure — loop continues
 
-        except ChatForwardsRestrictedError:
-            logger.warning(f"Chat {source_chat_id} has forwards restricted — skipping msg {message_id}")
-            return False
+        except SlowModeWaitError as e:
+            wait = e.seconds + 1
+            logger.warning(f"SlowMode on dest {dest_chat_id}: sleeping {wait}s")
+            await asyncio.sleep(wait)
+
+        except PERMANENT_ERRORS as e:
+            reason = type(e).__name__
+            logger.warning(
+                f"Permanent error forwarding msg {message_id} "
+                f"from {source_chat_id}: {reason}"
+            )
+            return False, reason
 
         except Exception as e:
-            logger.error(f"Forward error (attempt {attempt+1}): {e}")
-            await asyncio.sleep(3)
+            logger.error(f"Forward error msg {message_id} (attempt {attempt + 1}/3): {e}")
+            if attempt < 2:
+                await asyncio.sleep(3 * (attempt + 1))
 
-    return False
+    logger.error(f"Gave up forwarding msg {message_id} after 3 attempts")
+    return False, "max_retries"

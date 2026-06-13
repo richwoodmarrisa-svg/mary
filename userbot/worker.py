@@ -11,7 +11,8 @@ from telethon.tl.types import Message
 
 from .engine import (
     _extract_file_info, build_dest_index,
-    is_duplicate_fingerprint, forward_message
+    check_duplicate, forward_message,
+    get_messages_in_range,
 )
 
 logger = logging.getLogger(__name__)
@@ -21,24 +22,23 @@ ProgressCallback = Callable[[int, int, int, int], Awaitable[None]]
 # Args: (processed, total, moved, skipped)
 
 
-FILE_TYPE_MAP = {
-    "photo": {"photo"},
-    "video": {"video"},
-    "document": {"document"},
-    "audio": {"audio"},
-    "voice": {"voice"},
-    "sticker": {"sticker"},
-    "gif": {"gif"},
-    "text": {None},
-}
-
-
 def _should_include(file_type: Optional[str], allowed_types: set[str]) -> bool:
     if "all" in allowed_types:
         return True
     if file_type is None:
         return "text" in allowed_types
     return file_type in allowed_types
+
+
+def _build_source_link(source_chat_id: int, msg_id: int,
+                       topic_id: Optional[int], username: Optional[str]) -> str:
+    """Build a t.me link for a source message."""
+    if username:
+        return f"https://t.me/{username}/{msg_id}"
+    cid = str(source_chat_id).replace("-100", "")
+    if topic_id:
+        return f"https://t.me/c/{cid}/{topic_id}/{msg_id}"
+    return f"https://t.me/c/{cid}/{msg_id}"
 
 
 async def run_transfer(
@@ -58,21 +58,29 @@ async def run_transfer(
 ) -> dict:
     """
     Main transfer coroutine.
-    Returns a summary dict.
+    Returns a summary dict with keys: moved, skipped, errors, duplicate_links.
     """
     from db.queries import update_job, save_duplicate, add_to_index
 
     allowed_types = set(file_types.split(",")) if file_types != "all" else {"all"}
     fingerprints: set[str] = set()
 
-    summary = {
+    summary: dict = {
         "moved": 0,
         "skipped": 0,
         "errors": 0,
-        "duplicate_links": [],
+        "duplicate_links": [],  # list of (link, reason)
     }
 
-    # ── 1. Build destination fingerprint index ──────────────────────
+    # ── 1. Resolve source entity username once (for link building) ──
+    source_username: Optional[str] = None
+    try:
+        src_entity = await client.get_entity(source_chat_id)
+        source_username = getattr(src_entity, "username", None)
+    except Exception as e:
+        logger.warning(f"Could not resolve source entity {source_chat_id}: {e}")
+
+    # ── 2. Build destination fingerprint index ──────────────────────
     if scan_scope != "disabled":
         await progress_cb(0, 0, 0, 0)  # Signal "indexing"
         fingerprints = await build_dest_index(
@@ -81,26 +89,16 @@ async def run_transfer(
         )
         logger.info(f"Indexed {len(fingerprints)} fingerprints in destination")
 
-    # ── 2. Collect source messages ───────────────────────────────────
-    source_messages: list[Message] = []
-    iter_kwargs = {
-        "entity": source_chat_id,
-        "min_id": first_msg_id - 1,
-        "max_id": last_msg_id + 1,
-        "reverse": True,
-        "limit": None,
-    }
-    if source_topic_id:
-        iter_kwargs["reply_to"] = source_topic_id
-
-    async for msg in client.iter_messages(**iter_kwargs):
-        source_messages.append(msg)
+    # ── 3. Collect source messages ───────────────────────────────────
+    source_messages: list[Message] = await get_messages_in_range(
+        client, source_chat_id, first_msg_id, last_msg_id, source_topic_id
+    )
 
     total = len(source_messages)
     await update_job(db_session, job_id, total_messages=total)
     logger.info(f"Found {total} source messages to process")
 
-    # ── 3. Process each message ──────────────────────────────────────
+    # ── 4. Process each message ──────────────────────────────────────
     processed = 0
     for msg in source_messages:
         processed += 1
@@ -109,31 +107,19 @@ async def run_transfer(
         # Filter by file type
         file_type = info["file_type"] if info else None
         if not _should_include(file_type, allowed_types):
+            # Still count as processed but don't forward
+            await update_job(db_session, job_id, processed=processed)
+            await progress_cb(processed, total, summary["moved"], summary["skipped"])
             continue
 
         # Duplicate check
         if scan_scope != "disabled" and info:
-            dup, reason = is_duplicate_fingerprint(info, fingerprints)
-            if dup:
+            is_dup, reason = check_duplicate(info, fingerprints)
+            if is_dup:
                 summary["skipped"] += 1
-
-                # Build source link
-                username = None
-                try:
-                    entity = await client.get_entity(source_chat_id)
-                    username = getattr(entity, "username", None)
-                except Exception:
-                    pass
-
-                if username:
-                    link = f"https://t.me/{username}/{msg.id}"
-                elif source_topic_id:
-                    cid = str(source_chat_id).replace("-100", "")
-                    link = f"https://t.me/c/{cid}/{source_topic_id}/{msg.id}"
-                else:
-                    cid = str(source_chat_id).replace("-100", "")
-                    link = f"https://t.me/c/{cid}/{msg.id}"
-
+                link = _build_source_link(
+                    source_chat_id, msg.id, source_topic_id, source_username
+                )
                 summary["duplicate_links"].append((link, reason))
 
                 await save_duplicate(
@@ -151,21 +137,20 @@ async def run_transfer(
                 await progress_cb(processed, total, summary["moved"], summary["skipped"])
                 continue
 
-        # Forward
+        # Forward (or dry-run count)
         if not dry_run:
-            ok = await forward_message(client, source_chat_id, msg.id,
-                                       dest_chat_id, dest_topic_id)
+            ok, err_reason = await forward_message(
+                client, source_chat_id, msg.id, dest_chat_id, dest_topic_id
+            )
             if ok:
                 summary["moved"] += 1
-                # Add to fingerprint set so we don't duplicate within this run
+                # Add to in-memory fingerprint set to prevent intra-run duplicates
                 if info:
                     if info.get("file_unique_id"):
                         fingerprints.add(f"uid:{info['file_unique_id']}")
                     if info.get("file_size"):
                         fingerprints.add(f"sz:{info['file_size']}")
-
-                # Index the newly forwarded file
-                if info:
+                    # Persist to DB index
                     await add_to_index(
                         db_session,
                         chat_id=dest_chat_id,
@@ -177,8 +162,12 @@ async def run_transfer(
                     )
             else:
                 summary["errors"] += 1
+                logger.warning(
+                    f"Failed to forward msg {msg.id} from {source_chat_id}: {err_reason}"
+                )
         else:
-            summary["moved"] += 1  # dry run counts as "would move"
+            # Dry run — count as "would move" without actually forwarding
+            summary["moved"] += 1
 
         await update_job(db_session, job_id,
                          processed=processed,
@@ -186,7 +175,7 @@ async def run_transfer(
                          last_processed_id=msg.id)
         await progress_cb(processed, total, summary["moved"], summary["skipped"])
 
-        # Small rate-limit friendly delay
+        # Small rate-limit friendly delay between forwards
         await asyncio.sleep(0.05)
 
     return summary

@@ -22,6 +22,13 @@ router = Router()
 # Cache dialogs per user to avoid re-fetching on every button press
 _dialog_cache: dict[int, dict] = {}
 
+# Category display labels
+_CATEGORY_LABELS = {
+    "groups": "group",
+    "channels": "channel",
+    "private": "private chat",
+}
+
 
 async def _require_login(cb: CallbackQuery) -> str | None:
     """Return session_string or None and send error."""
@@ -89,17 +96,50 @@ async def cb_pick_chat_mode(cb: CallbackQuery):
     if not sess_str:
         return
 
-    # Refresh dialogs
-    await cb.message.edit_text("⏳ Loading your chats...", reply_markup=None)
-    client = await get_client(cb.from_user.id, sess_str)
-    dialogs = await get_dialogs(client)
-    _dialog_cache[cb.from_user.id] = dialogs
-
-    await cb.message.edit_text(
-        f"Choose a category for {'source' if mode == 'source' else 'destination'}:",
-        reply_markup=chat_category_menu(mode),
-    )
+    await cb.message.edit_text("⏳ Loading your chats…", reply_markup=None)
     await cb.answer()
+
+    try:
+        client = await get_client(cb.from_user.id, sess_str)
+        logger.info(f"Fetching dialogs for user {cb.from_user.id}")
+        dialogs = await get_dialogs(client)
+        _dialog_cache[cb.from_user.id] = dialogs
+
+        total = sum(len(v) for v in dialogs.values())
+        logger.info(
+            f"Dialog cache populated for user {cb.from_user.id}: "
+            f"{total} chats "
+            f"({len(dialogs['groups'])}G / {len(dialogs['channels'])}C / "
+            f"{len(dialogs['private'])}P)"
+        )
+
+        if total == 0:
+            await cb.message.edit_text(
+                "⚠️ No chats found in your account.\n\n"
+                "Make sure you are logged in with the correct account "
+                "and that you have joined some chats.",
+                reply_markup=back_btn("new_job"),
+            )
+            return
+
+        label = "source" if mode == "source" else "destination"
+        await cb.message.edit_text(
+            f"Choose a category for the <b>{label}</b>:\n\n"
+            f"👥 Groups: {len(dialogs['groups'])}\n"
+            f"📢 Channels: {len(dialogs['channels'])}\n"
+            f"💬 Private: {len(dialogs['private'])}",
+            reply_markup=chat_category_menu(mode),
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+        logger.exception(f"Failed to load dialogs for user {cb.from_user.id}: {e}")
+        await cb.message.edit_text(
+            f"❌ Failed to load chats: <code>{e}</code>\n\n"
+            "Please try again or re-login with /start.",
+            reply_markup=back_btn("new_job"),
+            parse_mode="HTML",
+        )
 
 
 # ── Category selected → show chat list ────────────────────────────
@@ -108,18 +148,34 @@ async def cb_pick_chat_mode(cb: CallbackQuery):
 async def cb_chat_category(cb: CallbackQuery):
     _, category, mode = cb.data.split(":")
     dialogs = _dialog_cache.get(cb.from_user.id, {})
+
+    # If cache is empty, prompt user to reload
+    if not dialogs:
+        await cb.answer(
+            "⚠️ Chat list not loaded yet. Please tap Set Source/Destination again.",
+            show_alert=True,
+        )
+        return
+
     chats = dialogs.get(category, [])
+    label = _CATEGORY_LABELS.get(category, category)
 
     if not chats:
-        await cb.answer(f"No {category} found.", show_alert=True)
+        await cb.answer(
+            f"No {label}s found in your account. Try a different category.",
+            show_alert=True,
+        )
         return
 
     state = get_state(cb.from_user.id)
     state.page_offset = 0
 
+    dest_label = "source" if mode == "source" else "destination"
     await cb.message.edit_text(
-        f"Select a {category[:-1]} as {'source' if mode == 'source' else 'destination'}:",
+        f"Select a <b>{label}</b> as <b>{dest_label}</b>:\n"
+        f"({len(chats)} found)",
         reply_markup=chat_list_keyboard(chats, category, mode, 0),
+        parse_mode="HTML",
     )
     await cb.answer()
 
@@ -147,11 +203,27 @@ async def cb_set_chat(cb: CallbackQuery):
     chat_id = int(chat_id_str)
     state = get_state(cb.from_user.id)
 
-    # Find chat info
+    # Validate source != destination
+    if mode == "source" and state.dest_chat_id == chat_id:
+        await cb.answer(
+            "⚠️ Source and destination cannot be the same chat.",
+            show_alert=True,
+        )
+        return
+    if mode == "dest" and state.source_chat_id == chat_id:
+        await cb.answer(
+            "⚠️ Source and destination cannot be the same chat.",
+            show_alert=True,
+        )
+        return
+
+    # Find chat info from cache
     dialogs = _dialog_cache.get(cb.from_user.id, {})
-    all_chats = (dialogs.get("groups", []) +
-                 dialogs.get("channels", []) +
-                 dialogs.get("private", []))
+    all_chats = (
+        dialogs.get("groups", []) +
+        dialogs.get("channels", []) +
+        dialogs.get("private", [])
+    )
     chat_info = next((c for c in all_chats if c["id"] == chat_id), None)
     has_topics = chat_info.get("has_topics", False) if chat_info else False
 
@@ -167,24 +239,45 @@ async def cb_set_chat(cb: CallbackQuery):
         state.dest_topic_title = None
 
     if has_topics:
-        # Load topics
-        await cb.message.edit_text(f"⏳ Loading topics for {title}...", reply_markup=None)
-        async with get_session_factory()() as db:
-            sess = await db_get_session(db, cb.from_user.id)
-        client = await get_client(cb.from_user.id, sess.session_string)
-        topics = await get_topics(client, chat_id)
+        await cb.message.edit_text(
+            f"⏳ Loading topics for <b>{title}</b>…",
+            reply_markup=None,
+            parse_mode="HTML",
+        )
+        await cb.answer()
+        try:
+            async with get_session_factory()() as db:
+                sess = await db_get_session(db, cb.from_user.id)
+            client = await get_client(cb.from_user.id, sess.session_string)
+            topics = await get_topics(client, chat_id)
 
-        if topics:
+            if topics:
+                await cb.message.edit_text(
+                    f"Select a topic in <b>{title}</b>:\n"
+                    f"({len(topics)} topics found)",
+                    reply_markup=topic_list_keyboard(topics, mode),
+                    parse_mode="HTML",
+                )
+                return
+            else:
+                # Forum group but no topics returned — treat as no-topic
+                await cb.message.edit_text(
+                    f"ℹ️ No topics found in <b>{title}</b>. "
+                    "Using General (no topic).",
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load topics for {chat_id}: {e}")
             await cb.message.edit_text(
-                f"Select a topic in <b>{title}</b>:",
-                reply_markup=topic_list_keyboard(topics, mode),
+                f"⚠️ Could not load topics for <b>{title}</b>: <code>{e}</code>\n"
+                "Proceeding without topic selection.",
                 parse_mode="HTML",
             )
-            await cb.answer()
-            return
+    else:
+        await cb.answer(
+            f"✅ {title} selected as {'source' if mode == 'source' else 'destination'}."
+        )
 
-    # No topics
-    await cb.answer(f"✅ {title} selected as {'source' if mode == 'source' else 'destination'}.")
     await _back_to_new_job(cb)
 
 
