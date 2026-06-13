@@ -117,6 +117,7 @@ def get_engine():
     global _engine
     if _engine is None:
         url = os.environ["DATABASE_URL"]
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
         _engine = create_async_engine(url, echo=False, pool_pre_ping=True)
     return _engine
 
