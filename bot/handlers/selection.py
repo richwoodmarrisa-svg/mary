@@ -199,8 +199,18 @@ async def cb_chat_page(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("setchat:"))
 async def cb_set_chat(cb: CallbackQuery):
-    _, mode, chat_id_str, title = cb.data.split(":", 3)
-    chat_id = int(chat_id_str)
+    parts = cb.data.split(":", 3)
+    if len(parts) < 4:
+        await cb.answer("❌ Invalid callback data", show_alert=True)
+        return
+    
+    _, mode, chat_id_str, title = parts
+    try:
+        chat_id = int(chat_id_str)
+    except ValueError:
+        await cb.answer("❌ Invalid chat ID", show_alert=True)
+        return
+    
     state = get_state(cb.from_user.id)
 
     # Validate source != destination
@@ -285,8 +295,18 @@ async def cb_set_chat(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("settopic:"))
 async def cb_set_topic(cb: CallbackQuery):
-    _, mode, topic_id_str, title = cb.data.split(":", 3)
-    topic_id = int(topic_id_str)
+    parts = cb.data.split(":", 3)
+    if len(parts) < 4:
+        await cb.answer("❌ Invalid callback data", show_alert=True)
+        return
+    
+    _, mode, topic_id_str, title = parts
+    try:
+        topic_id = int(topic_id_str)
+    except ValueError:
+        await cb.answer("❌ Invalid topic ID", show_alert=True)
+        return
+    
     state = get_state(cb.from_user.id)
 
     if mode == "source":
@@ -519,6 +539,4 @@ async def cb_toggle_dry_run(cb: CallbackQuery):
 async def _back_to_new_job(cb: CallbackQuery):
     """Re-trigger new_job display."""
     cb.data = "new_job"
-    from aiogram import Router as _R
-    # We re-use the handler directly
     await cb_new_job(cb)

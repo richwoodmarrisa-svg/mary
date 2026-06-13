@@ -22,7 +22,7 @@ def main_menu(logged_in: bool = False) -> InlineKeyboardMarkup:
             [_btn("ℹ️ Help", "help")],
         )
     return _kb(
-        [_btn("📋 My Chats", "list_chats"), _btn("➕ New Transfer", "new_job")],
+        [_btn("➕ New Transfer", "new_job")],
         [_btn("📂 My Jobs", "my_jobs")],
         [_btn("🚪 Logout", "logout")],
     )
@@ -36,11 +36,12 @@ def back_btn(target: str = "main_menu") -> InlineKeyboardMarkup:
 
 def chat_category_menu(mode: str = "source") -> InlineKeyboardMarkup:
     """Choose category of chat to browse."""
+    back_target = "main_menu" if mode == "source" else "new_job"
     return _kb(
         [_btn("👥 Groups", f"cats:groups:{mode}"),
          _btn("📢 Channels", f"cats:channels:{mode}")],
         [_btn("💬 Private", f"cats:private:{mode}")],
-        [_btn("⬅️ Back", "main_menu")],
+        [_btn("⬅️ Back", back_target)],
     )
 
 
@@ -53,7 +54,7 @@ def chat_list_keyboard(chats: list[dict], category: str,
     for c in page:
         icon = "📋" if c.get("has_topics") else "💬"
         rows.append([_btn(f"{icon} {c['title'][:40]}",
-                          f"setchat:{mode}:{c['id']}:{c['title'][:30]}")])
+                          f"setchat:{mode}:{c['id']}:{c['title'][:30]}")]):
 
     nav = []
     if offset > 0:
@@ -62,7 +63,9 @@ def chat_list_keyboard(chats: list[dict], category: str,
         nav.append(_btn("▶️ Next", f"chatpage:{category}:{mode}:{offset + PAGE}"))
     if nav:
         rows.append(nav)
-    rows.append([_btn("⬅️ Back", f"cats:{category}:{mode}")])
+    
+    back_target = f"cats:{category}:{mode}"
+    rows.append([_btn("⬅️ Back", back_target)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -70,9 +73,9 @@ def topic_list_keyboard(topics: list[dict], mode: str) -> InlineKeyboardMarkup:
     rows = []
     for t in topics:
         rows.append([_btn(f"📌 {t['title'][:40]}",
-                          f"settopic:{mode}:{t['id']}:{t['title'][:30]}")])
+                          f"settopic:{mode}:{t['id']}:{t['title'][:30]}")]):
     rows.append([_btn("⛔ No Topic (General)", f"settopic:{mode}:0:General")])
-    rows.append([_btn("⬅️ Back", f"new_job")])
+    rows.append([_btn("⬅️ Back", "new_job")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
