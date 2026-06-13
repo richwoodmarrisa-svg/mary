@@ -180,6 +180,30 @@ async def cb_chat_category(cb: CallbackQuery):
     await cb.answer()
 
 
+# ── Back from chat list to category menu ───────────────────────────
+
+@router.callback_query(F.data.startswith("back_category:"))
+async def cb_back_category(cb: CallbackQuery):
+    """Go back to category selection menu."""
+    _, category, mode = cb.data.split(":")
+    dialogs = _dialog_cache.get(cb.from_user.id, {})
+
+    if not dialogs:
+        await cb.answer("Chat list not loaded. Please reload.", show_alert=True)
+        return
+
+    label = "source" if mode == "source" else "destination"
+    await cb.message.edit_text(
+        f"Choose a category for the <b>{label}</b>:\n\n"
+        f"👥 Groups: {len(dialogs['groups'])}\n"
+        f"📢 Channels: {len(dialogs['channels'])}\n"
+        f"💬 Private: {len(dialogs['private'])}",
+        reply_markup=chat_category_menu(mode),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
 # ── Pagination ─────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("chatpage:"))

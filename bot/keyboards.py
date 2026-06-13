@@ -36,12 +36,11 @@ def back_btn(target: str = "main_menu") -> InlineKeyboardMarkup:
 
 def chat_category_menu(mode: str = "source") -> InlineKeyboardMarkup:
     """Choose category of chat to browse."""
-    back_target = "main_menu" if mode == "source" else "new_job"
     return _kb(
         [_btn("👥 Groups", f"cats:groups:{mode}"),
          _btn("📢 Channels", f"cats:channels:{mode}")],
         [_btn("💬 Private", f"cats:private:{mode}")],
-        [_btn("⬅️ Back", back_target)],
+        [_btn("⬅️ Back", "new_job")],
     )
 
 
@@ -64,8 +63,8 @@ def chat_list_keyboard(chats: list[dict], category: str,
     if nav:
         rows.append(nav)
     
-    back_target = f"cats:{category}:{mode}"
-    rows.append([_btn("⬅️ Back", back_target)])
+    # Back button goes to category selection menu
+    rows.append([_btn("⬅️ Back", f"back_category:{category}:{mode}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -146,7 +145,7 @@ def job_confirm_keyboard(dry_run: bool) -> InlineKeyboardMarkup:
     )
 
 
-# ── Running job ────────────────────────���───────────────────────────
+# ── Running job ──────────────────────────────────��─────────────────
 
 def running_job_keyboard(job_id: int) -> InlineKeyboardMarkup:
     return _kb([_btn("⛔ Stop Job", f"stopjob:{job_id}")])
