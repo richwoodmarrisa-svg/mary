@@ -54,7 +54,7 @@ def chat_list_keyboard(chats: list[dict], category: str,
     for c in page:
         icon = "📋" if c.get("has_topics") else "💬"
         rows.append([_btn(f"{icon} {c['title'][:40]}",
-                          f"setchat:{mode}:{c['id']}:{c['title'][:30]}")]):
+                          f"setchat:{mode}:{c['id']}:{c['title'][:30]}")])
 
     nav = []
     if offset > 0:
@@ -73,7 +73,7 @@ def topic_list_keyboard(topics: list[dict], mode: str) -> InlineKeyboardMarkup:
     rows = []
     for t in topics:
         rows.append([_btn(f"📌 {t['title'][:40]}",
-                          f"settopic:{mode}:{t['id']}:{t['title'][:30]}")]):
+                          f"settopic:{mode}:{t['id']}:{t['title'][:30]}")])
     rows.append([_btn("⛔ No Topic (General)", f"settopic:{mode}:0:General")])
     rows.append([_btn("⬅️ Back", "new_job")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -146,7 +146,7 @@ def job_confirm_keyboard(dry_run: bool) -> InlineKeyboardMarkup:
     )
 
 
-# ── Running job ────────────────────────────────────────────────────
+# ── Running job ────────────────────────���───────────────────────────
 
 def running_job_keyboard(job_id: int) -> InlineKeyboardMarkup:
     return _kb([_btn("⛔ Stop Job", f"stopjob:{job_id}")])
