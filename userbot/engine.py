@@ -37,8 +37,13 @@ async def get_client(telegram_id: int, session_string: str) -> TelegramClient:
         if client.is_connected():
             return client
         # Reconnect
-        await client.connect()
-        return client
+        try:
+            await client.connect()
+            return client
+        except Exception as e:
+            logger.warning(f"Failed to reconnect client: {e}")
+            # Remove bad client and create new one
+            _clients.pop(telegram_id, None)
 
     api_id, api_hash = _get_api_credentials()
     client = TelegramClient(
@@ -77,7 +82,13 @@ async def get_dialogs(client: TelegramClient) -> dict:
     skipped = 0
 
     try:
+        dialogs_list = []
         async for dialog in client.iter_dialogs():
+            dialogs_list.append(dialog)
+        
+        logger.info(f"Retrieved {len(dialogs_list)} dialogs")
+        
+        for dialog in dialogs_list:
             try:
                 entity = dialog.entity
                 if entity is None:
@@ -99,7 +110,8 @@ async def get_dialogs(client: TelegramClient) -> dict:
                 }
 
                 if isinstance(entity, Channel):
-                    if entity.megagroup or entity.gigagroup:
+                    # Check if it's a megagroup (supergroup)
+                    if getattr(entity, "megagroup", False) or getattr(entity, "gigagroup", False):
                         categories["groups"].append(entry)
                     else:
                         categories["channels"].append(entry)
@@ -221,27 +233,35 @@ async def build_dest_index(client: TelegramClient, db_session,
     if scope == "topic" and dest_topic_id:
         iter_kwargs["reply_to"] = dest_topic_id
 
-    async for msg in client.iter_messages(**iter_kwargs):
-        info = _extract_file_info(msg)
-        if not info:
-            continue
+    try:
+        async for msg in client.iter_messages(**iter_kwargs):
+            info = _extract_file_info(msg)
+            if not info:
+                continue
 
-        if info["file_unique_id"]:
-            fingerprints.add(f"uid:{info['file_unique_id']}")
-        if info["file_size"]:
-            fingerprints.add(f"sz:{info['file_size']}")
+            if info["file_unique_id"]:
+                fingerprints.add(f"uid:{info['file_unique_id']}")
+            if info["file_size"]:
+                fingerprints.add(f"sz:{info['file_size']}")
 
-        # Also persist to DB index for caching
-        await add_to_index(
-            db_session,
-            chat_id=dest_chat_id,
-            topic_id=dest_topic_id if scope == "topic" else None,
-            message_id=msg.id,
-            file_unique_id=info["file_unique_id"],
-            file_size=info["file_size"],
-            file_type=info["file_type"],
-        )
+            # Also persist to DB index for caching
+            await add_to_index(
+                db_session,
+                chat_id=dest_chat_id,
+                topic_id=dest_topic_id if scope == "topic" else None,
+                message_id=msg.id,
+                file_unique_id=info["file_unique_id"],
+                file_size=info["file_size"],
+                file_type=info["file_type"],
+            )
+    except FloodWaitError as e:
+        logger.warning(f"FloodWait during build_dest_index: sleeping {e.seconds}s")
+        await asyncio.sleep(e.seconds + 2)
+    except Exception as e:
+        logger.error(f"Error building destination index: {e}")
+        raise
 
+    logger.info(f"Built index with {len(fingerprints)} fingerprints")
     return fingerprints
 
 
@@ -290,8 +310,12 @@ async def get_messages_in_range(
         logger.warning(f"FloodWait fetching messages: sleeping {e.seconds}s")
         await asyncio.sleep(e.seconds + 2)
         # Retry once after flood wait
-        async for msg in client.iter_messages(**iter_kwargs):
-            messages.append(msg)
+        try:
+            async for msg in client.iter_messages(**iter_kwargs):
+                messages.append(msg)
+        except Exception as retry_e:
+            logger.error(f"Error on retry: {retry_e}")
+            raise
     except Exception as e:
         logger.error(f"Error fetching messages from {chat_id}: {e}")
         raise

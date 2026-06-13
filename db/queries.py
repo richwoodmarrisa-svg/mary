@@ -7,7 +7,7 @@ from .models import UserSession, TransferJob, FileIndex, DuplicateRecord
 from typing import Optional, List
 
 
-# ── Sessions ──────────────────────────────────
+# ── Sessions ────────────────────────────────
 
 async def get_session(db: AsyncSession, telegram_id: int) -> Optional[UserSession]:
     result = await db.execute(
@@ -44,7 +44,7 @@ async def delete_session(db: AsyncSession, telegram_id: int):
     await db.commit()
 
 
-# ── Jobs ──────────────────────────────────────
+# ── Jobs ────────────────────────────────
 
 async def create_job(db: AsyncSession, **kwargs) -> TransferJob:
     job = TransferJob(**kwargs)
